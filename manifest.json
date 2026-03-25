@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Incident Summarizer Pro",
+  "version": "3.0",
+  "description": "AI-powered incident & ticket analyzer for developers. Smart offline mode + GPT-4o/Gemini. Root cause, solution, actions — instantly.",
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+S", "mac": "MacCtrl+Shift+S" },
+      "description": "Open Incident Summarizer"
+    }
+  },
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "Summarize Incident",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -1,0 +1,2449 @@
+background.js
+
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'getPageText') {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (!tabs[0]) return sendResponse({ error: 'No active tab' });
+      chrome.scripting.executeScript(
+        { target: { tabId: tabs[0].id }, func: extractPageText },
+        (results) => {
+          if (chrome.runtime.lastError) {
+            sendResponse({ error: chrome.runtime.lastError.message });
+          } else {
+            sendResponse({ text: results[0]?.result?.text || '', platform: results[0]?.result?.platform || 'unknown' });
+          }
+        }
+      );
+    });
+    return true;
+  }
+});
+
+// ─── Injected into page ───────────────────────────────────────────────────────
+function extractPageText() {
+
+  // ── Platform-specific extraction ─────────────────────
+  const hostname = location.hostname;
+
+  // GitHub Issues / PRs
+  if (hostname.includes('github.com')) {
+    const body = document.querySelector('.comment-body, [data-testid="issue-body"], .js-comment-body');
+    const title = document.querySelector('h1.gh-header-title bdi, h1[data-testid="issue-title"]');
+    const labels = [...document.querySelectorAll('.IssueLabel, [data-testid="labels"] a')].map(el => el.textContent.trim()).join(', ');
+    if (body) {
+      const titleText = title ? `Title: ${title.textContent.trim()}\n` : '';
+      const labelText = labels ? `Labels: ${labels}\n` : '';
+      return { text: (titleText + labelText + body.innerText.trim()).slice(0, 8000), platform: 'GitHub' };
+    }
+  }
+
+  // Jira
+  if (hostname.includes('atlassian.net') || hostname.includes('jira.')) {
+    const selectors = [
+      '#description-val',
+      '[data-testid="issue.views.issue-base.foundation.description.description"]',
+      '[data-component-selector="issue-body-pin-field-description"]',
+      '.ak-renderer-document',
+      '#issue-content',
+    ];
+    const title = document.querySelector('h1[data-testid="issue.views.issue-base.foundation.summary.heading"], h1#summary-val, h1.issue-header-field');
+    const priority = document.querySelector('[data-testid*="priority"] span, #priority-val');
+    const status = document.querySelector('[data-testid*="status"] span, #status-val');
+
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el && el.innerText?.trim().length > 30) {
+        const titleText = title ? `Summary: ${title.textContent.trim()}\n` : '';
+        const meta = [priority && `Priority: ${priority.textContent.trim()}`, status && `Status: ${status.textContent.trim()}`].filter(Boolean).join(' | ');
+        return { text: (titleText + (meta ? meta + '\n' : '') + el.innerText.trim()).slice(0, 8000), platform: 'Jira' };
+      }
+    }
+  }
+
+  // Linear
+  if (hostname.includes('linear.app')) {
+    const title = document.querySelector('h1[data-cy="issue-title"], [class*="title"]');
+    const body = document.querySelector('[class*="description"] .ProseMirror, [class*="content"] [class*="editor"]');
+    const priority = document.querySelector('[class*="priority"] [class*="label"]');
+    if (body) {
+      const titleText = title ? `Issue: ${title.textContent.trim()}\n` : '';
+      const priText = priority ? `Priority: ${priority.textContent.trim()}\n` : '';
+      return { text: (titleText + priText + body.innerText.trim()).slice(0, 8000), platform: 'Linear' };
+    }
+  }
+
+  // ServiceNow
+  if (hostname.includes('servicenow.com') || hostname.includes('service-now.com')) {
+    const desc = document.querySelector('#incident_short_description, [id*="description"], textarea[id*="description"], [name="description"]');
+    const workNotes = document.querySelector('[id*="work_notes"], [id*="comments"]');
+    if (desc) {
+      const workText = workNotes ? '\nWork Notes:\n' + workNotes.value : '';
+      return { text: ((desc.value || desc.innerText || '').trim() + workText).slice(0, 8000), platform: 'ServiceNow' };
+    }
+  }
+
+  // PagerDuty
+  if (hostname.includes('pagerduty.com')) {
+    const title = document.querySelector('h1[data-test="incident-title"], .incident-header__title');
+    const body = document.querySelector('[data-test="incident-details"], .incident-body');
+    if (body) {
+      const titleText = title ? `Incident: ${title.textContent.trim()}\n` : '';
+      return { text: (titleText + body.innerText.trim()).slice(0, 8000), platform: 'PagerDuty' };
+    }
+  }
+
+  // Datadog
+  if (hostname.includes('datadoghq.com')) {
+    const body = document.querySelector('[class*="incident-timeline"], [class*="description"], [data-test*="description"]');
+    if (body) return { text: body.innerText.trim().slice(0, 8000), platform: 'Datadog' };
+  }
+
+  // Notion
+  if (hostname.includes('notion.so') || hostname.includes('notion.site')) {
+    const body = document.querySelector('.notion-page-content');
+    if (body) return { text: body.innerText.trim().slice(0, 8000), platform: 'Notion' };
+  }
+
+  // ── Generic smart fallback ────────────────────────────
+  // Priority: semantic HTML first
+  const semanticCandidates = [
+    document.querySelector('article[class*="issue"], article[class*="incident"]'),
+    document.querySelector('[role="main"] article'),
+    document.querySelector('main article'),
+    document.querySelector('main'),
+    document.querySelector('article'),
+    document.querySelector('[role="main"]'),
+  ];
+  for (const el of semanticCandidates) {
+    if (!el) continue;
+    const text = cleanText(el);
+    if (text.length > 100) return { text: text.slice(0, 8000), platform: 'Web' };
+  }
+
+  // Named description/content areas
+  const namedSelectors = [
+    '[id*="description"]', '[class*="description"]',
+    '[id*="incident"]', '[class*="incident"]',
+    '[data-testid*="description"]', 'textarea',
+    '[contenteditable="true"]',
+  ];
+  for (const sel of namedSelectors) {
+    const els = document.querySelectorAll(sel);
+    for (const el of els) {
+      const text = (el.value || el.innerText || el.textContent || '').trim();
+      if (text.length > 80) return { text: text.slice(0, 8000), platform: 'Web' };
+    }
+  }
+
+  // Last resort: paragraph extraction (strips chrome noise)
+  const paras = Array.from(document.querySelectorAll('p, li'))
+    .map(el => el.innerText?.trim())
+    .filter(t => t && t.length > 25)
+    .join('\n');
+
+  if (paras.length > 100) return { text: paras.slice(0, 8000), platform: 'Web' };
+
+  return { text: cleanText(document.body).slice(0, 8000), platform: 'Web' };
+
+  // Helper: extract text while stripping nav/header/footer/script
+  function cleanText(root) {
+    const clone = root.cloneNode(true);
+    const strip = clone.querySelectorAll('nav, header, footer, script, style, aside, [aria-hidden="true"], [class*="sidebar"], [id*="sidebar"], [class*="nav"], [id*="nav"]');
+    strip.forEach(el => el.remove());
+    return (clone.innerText || clone.textContent || '').replace(/\s{3,}/g, '\n').trim();
+  }
+}
+
+
+
+
+----         engine.js.    --------------
+
+// ════════════════════════════════════════════════════════
+//  SMART INCIDENT SUMMARIZER ENGINE — Zero LLM, Pure JS
+//  v3.0 — negation-aware, hit-count weighted, full output
+// ════════════════════════════════════════════════════════
+
+const Engine = (() => {
+
+  // ── Severity signal words ─────────────────────────────
+  const SEVERITY = {
+    critical: {
+      words: ['down','outage','critical','crash','crashed','unavailable','not responding',
+              'production down','p0','p1','complete failure','total loss','data loss',
+              'security breach','breach','hacked','ransomware','all users','entire system',
+              'database down','service unavailable','500 error','system failure'],
+      score: 4, label: 'CRITICAL', color: '#ff4d4d'
+    },
+    high: {
+      words: ['error','failed','failure','broken','not working','degraded','major',
+              'multiple users','p2','high','intermittent','spike','timeout','slow',
+              'latency','500','503','502','exception','null pointer','oom','memory leak',
+              'unable to','can\'t access','cannot access','login failed','authentication failed'],
+      score: 3, label: 'HIGH', color: '#f59e0b'
+    },
+    medium: {
+      words: ['issue','problem','warning','delay','partial','some users','occasionally',
+              'unexpected','incorrect','mismatch','p3','medium','moderate','wrong',
+              'inconsistent','missing','not loading'],
+      score: 2, label: 'MEDIUM', color: '#facc15'
+    },
+    low: {
+      words: ['minor','cosmetic','ui','display','typo','enhancement','p4','low','question',
+              'feature','request','clarification','suggestion','feedback'],
+      score: 1, label: 'LOW', color: '#22c55e'
+    }
+  };
+
+  // Negation phrases — if found near a severity word, ignore that word
+  const NEGATIONS = ['no ','not ','never ','without ','fixed ','resolved ','cleared ','no longer '];
+
+  // ── Category detection ────────────────────────────────
+  const CATEGORIES = {
+    'Database':    ['database','db','sql','query','mongodb','postgres','mysql','oracle','redis','table','schema','migration','ora-','deadlock'],
+    'Network':     ['network','dns','firewall','vpn','ip','port','connection','socket','timeout','latency','bandwidth','packet','traceroute','ping'],
+    'Auth':        ['login','auth','authentication','password','sso','oauth','token','session','permission','access denied','403','401','jwt','ldap'],
+    'API':         ['api','endpoint','rest','graphql','request','response','payload','webhook','integration','microservice','swagger','grpc'],
+    'Server':      ['server','cpu','memory','ram','disk','vm','container','kubernetes','docker','pod','node','cluster','k8s','ec2','gcp'],
+    'UI/Frontend': ['ui','frontend','page','browser','screen','button','form','display','render','css','javascript','react','vue','angular'],
+    'Payment':     ['payment','transaction','billing','invoice','stripe','razorpay','checkout','refund','charge','pgw','gateway'],
+    'Email/Notif': ['email','notification','sms','alert','smtp','sendgrid','push','mail','twilio','ses'],
+    'Data/ETL':    ['pipeline','etl','sync','data','batch','job','cron','scheduler','kafka','queue','worker','airflow','spark'],
+    'Storage':     ['file','upload','s3','blob','storage','bucket','disk full','attachment','image','pdf','cdn','cloudfront'],
+    'CI/CD':       ['deploy','deployment','build','pipeline','ci','cd','jenkins','github actions','helm','release','rollback'],
+    'Security':    ['breach','hack','vulnerability','injection','xss','csrf','malware','ransomware','exploit','pentest'],
+  };
+
+  // ── Patterns for auto-detection ───────────────────────
+  const PATTERNS = {
+    errorCodes:   /\b([A-Z]{2,8}[-_]?\d{3,6}|[Ee]rror\s*\d{3,6}|HTTP\s*\d{3}|[45]\d{2}|ORA-\d+|ERR_[A-Z_]+)\b/g,
+    ips:          /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g,
+    timestamps:   /\b\d{1,2}[:\-]\d{2}(?:[:\-]\d{2})?(?:\s*(?:AM|PM|UTC|IST|GMT|PST|EST))?\b|\d{4}[-/]\d{2}[-/]\d{2}(?:T\d{2}:\d{2})?/gi,
+    urls:         /https?:\/\/[^\s<>'"]+/g,
+    services:     /\b[A-Z][a-z]+(?:Service|API|DB|Server|App|Portal|Module|System|Engine|Gateway|Worker|Queue|Bus|Hub)\b/g,
+    percentages:  /\b\d+(?:\.\d+)?%/g,
+    userCounts:   /\b\d[\d,]*\s*(?:users?|customers?|clients?|accounts?|sessions?|requests?)\b/gi,
+    versions:     /\bv?\d+\.\d+(?:\.\d+)?(?:-[\w.]+)?\b/g,
+  };
+
+  // ── Stopwords (ignored in scoring) ───────────────────
+  const STOPWORDS = new Set([
+    'the','a','an','is','are','was','were','be','been','being','have','has','had',
+    'do','does','did','will','would','could','should','may','might','shall','can',
+    'to','of','in','on','at','by','for','with','from','into','through','during',
+    'and','or','but','if','then','so','as','this','that','these','those','it',
+    'its','we','our','they','their','he','she','you','your','i','my','me','us',
+    'not','no','also','please','hi','hello','team','ticket','incident','report',
+    'below','above','following','noted','kindly','attached','please','find','dear',
+  ]);
+
+  // ── Recommended solutions per category ───────────────
+  const SOLUTIONS = {
+    'Database': [
+      'Check connection pool size and increase if saturated',
+      'Review slow query logs and add missing indexes',
+      'Verify DB process is running: `systemctl status postgresql`',
+      'Check disk space on DB host — full disk causes failures',
+      'Review recent schema migrations for breaking changes',
+    ],
+    'Network': [
+      'Run `traceroute` / `mtr` to identify the failing hop',
+      'Check firewall rules and security group configurations',
+      'Verify DNS resolution: `nslookup <service-hostname>`',
+      'Test TCP connectivity: `telnet <host> <port>`',
+      'Review recent network changes (VPN, load balancer, CDN config)',
+    ],
+    'Auth': [
+      'Check auth service health and logs for JWT validation errors',
+      'Verify SSO/OAuth provider is reachable and certs are valid',
+      'Check token expiry — consider refreshing client credentials',
+      'Review recent IAM/permission changes that may have locked users out',
+      'Test auth endpoint directly: `curl -I <auth-url>`',
+    ],
+    'API': [
+      'Check API gateway logs for upstream errors (502/503/504)',
+      'Verify upstream service health and circuit breaker state',
+      'Review recent API contract changes (breaking schema changes)',
+      'Check rate limits — client may be throttled',
+      'Trace request flow end-to-end using correlation ID',
+    ],
+    'Server': [
+      'Check CPU/memory/disk: `top`, `df -h`, `free -m`',
+      'Review OOM killer logs: `dmesg | grep -i oom`',
+      'Check for runaway processes consuming resources',
+      'Restart affected service pod if kubernetes: `kubectl rollout restart`',
+      'Review node health via monitoring dashboard (Grafana/Datadog)',
+    ],
+    'UI/Frontend': [
+      'Check browser console for JS errors and failed network requests',
+      'Verify CDN assets are reachable and cache is not stale',
+      'Test on multiple browsers to isolate browser-specific issue',
+      'Check for recent frontend deployments and consider rollback',
+      'Review Content Security Policy headers for blocked resources',
+    ],
+    'Payment': [
+      'Check payment gateway dashboard for service outage',
+      'DO NOT auto-retry failed transactions — risk of double-charge',
+      'Verify webhook signature validation logic',
+      'Review API key rotation — payment keys may have expired',
+      'Contact payment provider support with failed transaction IDs',
+    ],
+    'Email/Notif': [
+      'Check SMTP relay logs and bounce rates',
+      'Verify email provider API key is valid and quota not exhausted',
+      'Test with a direct SMTP send to isolate the failure point',
+      'Review spam/bounce lists — sender domain may be blacklisted',
+    ],
+    'Data/ETL': [
+      'Inspect pipeline run logs for the failed job step',
+      'Check upstream data source availability (DB, API, S3)',
+      'Verify queue depth — consumer may be backed up',
+      'Review recent schema changes in source data',
+      'Re-run failed pipeline with debug logging enabled',
+    ],
+    'Storage': [
+      'Check bucket/volume disk usage and quotas',
+      'Verify IAM permissions for the service account accessing storage',
+      'Test file upload directly via CLI to isolate SDK issues',
+      'Review CDN configuration for stale cache on static assets',
+    ],
+    'CI/CD': [
+      'Check build logs for exact failure step',
+      'Verify environment secrets/variables are set correctly',
+      'Consider immediate rollback to last stable release tag',
+      'Check for dependency version conflicts in the build',
+      'Review recent infra changes (Helm chart, Dockerfile)',
+    ],
+    'Security': [
+      '🚨 Isolate affected systems immediately',
+      'Preserve logs — do not restart/wipe before forensic capture',
+      'Rotate all credentials and API keys immediately',
+      'Notify security team and relevant stakeholders',
+      'Document timeline of events for incident post-mortem',
+    ],
+  };
+
+  // ═════════════════════════════════════════════════════
+  //  MAIN ANALYZE FUNCTION
+  // ═════════════════════════════════════════════════════
+  function analyze(rawText) {
+    const text = rawText.trim();
+    if (!text || text.length < 20) return null;
+
+    const sentences  = splitSentences(text);
+    const wordFreq   = buildWordFrequency(text);
+    const severity   = detectSeverity(text);
+    const categories = detectCategories(text);
+    const extracted  = extractPatterns(text);
+    const topSentences  = rankSentences(sentences, wordFreq, extracted);
+    const whatHappened  = buildWhatHappened(topSentences, sentences);
+    const affected      = detectAffected(text, extracted);
+    const timeline      = buildTimeline(text, extracted);
+    const actions       = suggestActions(text, categories, severity, extracted);
+    const solution      = buildSolution(categories, severity, text);
+    const rootCause     = inferRootCause(text, categories, extracted);
+    const readTime      = Math.ceil(text.split(/\s+/).length / 200);
+
+    return {
+      severity,
+      categories,
+      extracted,
+      whatHappened,
+      affected,
+      timeline,
+      actions,
+      solution,
+      rootCause,
+      readTime,
+      originalLength: sentences.length,
+      summaryLength: whatHappened.length,
+    };
+  }
+
+  // ── Split into sentences ──────────────────────────────
+  function splitSentences(text) {
+    return text
+      .replace(/\n{2,}/g, ' |BREAK| ')
+      .split(/(?<=[.!?])\s+(?=[A-Z])|\|BREAK\||(?<=:)\s*\n/g)
+      .map(s => s.replace('|BREAK|', '').trim())
+      .filter(s => s.length > 15);
+  }
+
+  // ── Build word frequency map ──────────────────────────
+  function buildWordFrequency(text) {
+    const words = text.toLowerCase().match(/\b[a-z]{3,}\b/g) || [];
+    const freq = {};
+    words.forEach(w => {
+      if (!STOPWORDS.has(w)) freq[w] = (freq[w] || 0) + 1;
+    });
+    return freq;
+  }
+
+  // ── Negation-aware severity check ────────────────────
+  function hasNegatedWord(lower, word) {
+    const idx = lower.indexOf(word);
+    if (idx === -1) return false;
+    const context = lower.slice(Math.max(0, idx - 30), idx);
+    return NEGATIONS.some(neg => context.includes(neg));
+  }
+
+  // ── Detect severity (negation-aware + hit-count weighted) ──
+  function detectSeverity(text) {
+    const lower = text.toLowerCase();
+    let bestScore = 0;
+    let result = { ...SEVERITY.low, hits: [] };
+
+    for (const [key, data] of Object.entries(SEVERITY)) {
+      const hits = data.words.filter(w => {
+        if (!lower.includes(w)) return false;
+        return !hasNegatedWord(lower, w);
+      });
+
+      // Weight = base score × sqrt(hit count) for multi-signal boost
+      const weighted = hits.length > 0 ? data.score * Math.sqrt(hits.length) : 0;
+      if (weighted > bestScore) {
+        bestScore = weighted;
+        result = { ...data, hits };
+      }
+    }
+    return result;
+  }
+
+  // ── Detect categories ─────────────────────────────────
+  function detectCategories(text) {
+    const lower = text.toLowerCase();
+    const found = [];
+    for (const [cat, words] of Object.entries(CATEGORIES)) {
+      const hits = words.filter(w => lower.includes(w));
+      if (hits.length > 0) found.push({ cat, hits: hits.length });
+    }
+    // Sort by hit count, return top 5
+    return found.sort((a, b) => b.hits - a.hits).slice(0, 5).map(f => f.cat);
+  }
+
+  // ── Extract patterns (codes, IPs, etc.) ──────────────
+  function extractPatterns(text) {
+    const result = {};
+    for (const [key, regex] of Object.entries(PATTERNS)) {
+      const matches = [...new Set(text.match(new RegExp(regex.source, regex.flags)) || [])];
+      if (matches.length) result[key] = matches.slice(0, 6);
+    }
+    return result;
+  }
+
+  // ── Score and rank sentences ──────────────────────────
+  function rankSentences(sentences, wordFreq, extracted) {
+    const maxFreq = Math.max(...Object.values(wordFreq), 1);
+
+    return sentences.map((sentence, idx) => {
+      let score = 0;
+      const words = sentence.toLowerCase().match(/\b[a-z]{3,}\b/g) || [];
+
+      words.forEach(w => {
+        if (wordFreq[w]) score += wordFreq[w] / maxFreq;
+      });
+
+      // Positional bonus
+      if (idx === 0) score *= 1.8;
+      if (idx === 1) score *= 1.3;
+
+      // Signal bonuses
+      if (/[45]\d{2}|error|fail|crash|down|critical/i.test(sentence)) score *= 1.5;
+      if (/\d+%|\d+\s*users?|\d+\s*minutes?/i.test(sentence)) score *= 1.3;
+      if (/since|started|began|reported|noticed/i.test(sentence)) score *= 1.2;
+
+      // Penalty: too short or too long
+      if (sentence.length < 30) score *= 0.5;
+      if (sentence.length > 300) score *= 0.7;
+
+      return { sentence, score, idx };
+    })
+    .sort((a, b) => b.score - a.score);
+  }
+
+  // ── Build "What Happened" summary ─────────────────────
+  function buildWhatHappened(ranked, all) {
+    const chosen = new Set();
+    chosen.add(0);
+    ranked.slice(0, 5).forEach(r => chosen.add(r.idx));
+
+    return [...chosen]
+      .sort((a, b) => a - b)
+      .slice(0, 3)
+      .map(i => all[i])
+      .filter(Boolean);
+  }
+
+  // ── Who is affected ───────────────────────────────────
+  function detectAffected(text, extracted) {
+    const lower = text.toLowerCase();
+    const parts = [];
+
+    if (extracted.userCounts?.length) parts.push(extracted.userCounts[0]);
+    else if (lower.includes('all users')) parts.push('All users');
+    else if (lower.includes('some users')) parts.push('Some users');
+    else if (lower.match(/customer|client/)) parts.push('Customers');
+    else if (lower.match(/internal|employee|staff|team/)) parts.push('Internal users');
+
+    if (lower.includes('production') || lower.includes('prod')) parts.push('Production');
+    else if (lower.includes('staging')) parts.push('Staging');
+    else if (lower.includes('dev ')) parts.push('Dev environment');
+
+    if (extracted.services?.length) parts.push(...extracted.services.slice(0, 2));
+
+    return parts.length ? parts.join(' · ') : 'Scope unclear — needs investigation';
+  }
+
+  // ── Timeline from timestamps ──────────────────────────
+  function buildTimeline(text, extracted) {
+    if (!extracted.timestamps?.length) return null;
+    return extracted.timestamps.slice(0, 5);
+  }
+
+  // ── Infer probable root cause ─────────────────────────
+  function inferRootCause(text, categories, extracted) {
+    const lower = text.toLowerCase();
+    const clues = [];
+
+    if (lower.match(/after\s+(deploying|deploy|deployment|release|update|upgrade|migration)/))
+      clues.push('Recent deployment is likely the trigger — check diff and consider rollback');
+    if (lower.match(/config|configuration|env\s|environment\s+variable|secret/))
+      clues.push('Configuration or environment variable change may be the cause');
+    if (lower.match(/disk\s*full|storage\s*full|no\s*space/))
+      clues.push('Disk/storage exhaustion detected as probable cause');
+    if (lower.match(/memory\s*leak|oom|out\s*of\s*memory/))
+      clues.push('Memory leak or OOM condition — application needs restart and heap analysis');
+    if (lower.match(/certificate|cert|ssl|tls|expired/))
+      clues.push('SSL/TLS certificate expiry may be causing connection failures');
+    if (lower.match(/rate\s*limit|throttl|quota/))
+      clues.push('Rate limiting or quota exceeded on an upstream service');
+    if (lower.match(/spike|surge|traffic|load|scale/))
+      clues.push('Traffic spike causing resource exhaustion — consider scaling out');
+    if (extracted.versions?.length)
+      clues.push(`Version ${extracted.versions[0]} may have introduced a regression`);
+
+    if (clues.length === 0) {
+      if (categories.includes('Database')) clues.push('DB-level failure — check connection limits and query performance');
+      else if (categories.includes('Network')) clues.push('Network-level disruption — check routing and firewall rules');
+      else clues.push('Root cause unclear — correlate logs, metrics, and recent changes');
+    }
+
+    return clues.slice(0, 2);
+  }
+
+  // ── Build recommended solution ────────────────────────
+  function buildSolution(categories, severity, text) {
+    const steps = [];
+
+    // Universal first action based on severity
+    if (severity.label === 'CRITICAL') {
+      steps.push('🚨 Page the on-call lead immediately — do not wait');
+      steps.push('Open a war room bridge (Zoom/Slack) and pin incident channel');
+    } else if (severity.label === 'HIGH') {
+      steps.push('Notify the on-call engineer and team lead');
+    }
+
+    // Category-specific solutions (top 2 categories)
+    for (const cat of categories.slice(0, 2)) {
+      const catSteps = SOLUTIONS[cat];
+      if (catSteps) steps.push(...catSteps.slice(0, 2));
+    }
+
+    // Universal closing steps
+    steps.push('Document all findings in the incident ticket with timestamps');
+    if (severity.label === 'CRITICAL' || severity.label === 'HIGH') {
+      steps.push('Schedule a blameless post-mortem within 48 hours');
+    }
+
+    return [...new Set(steps)].slice(0, 7);
+  }
+
+  // ── Suggest actions based on context ─────────────────
+  function suggestActions(text, categories, severity, extracted) {
+    const lower = text.toLowerCase();
+    const actions = [];
+
+    actions.push(`Verify current system status${extracted.services?.length ? ` — check ${extracted.services[0]}` : ''}`);
+
+    if (categories.includes('Database')) {
+      actions.push('Check DB connection pool and query logs');
+      if (lower.includes('slow') || lower.includes('timeout')) actions.push('Run EXPLAIN on slow queries, check index usage');
+    }
+    if (categories.includes('Network')) {
+      actions.push('Test connectivity and run traceroute to affected endpoints');
+      if (extracted.ips?.length) actions.push(`Investigate IP: ${extracted.ips[0]}`);
+    }
+    if (categories.includes('Auth')) {
+      actions.push('Check auth service logs and token expiry settings');
+      if (lower.includes('401') || lower.includes('403')) actions.push('Verify API keys/tokens are not expired or revoked');
+    }
+    if (categories.includes('API')) {
+      actions.push('Check API gateway logs and upstream service health');
+      if (extracted.errorCodes?.length) actions.push(`Investigate error code: ${extracted.errorCodes[0]}`);
+    }
+    if (categories.includes('Server')) {
+      actions.push('Check CPU/memory/disk utilisation on affected nodes');
+      if (lower.includes('memory') || lower.includes('oom')) actions.push('Analyze heap dumps — possible memory leak');
+    }
+    if (categories.includes('Payment')) {
+      actions.push('Check payment gateway dashboard for failed transactions');
+      actions.push('Do NOT retry failed payments without manual review');
+    }
+
+    if (severity.label === 'CRITICAL') {
+      actions.unshift('🚨 ESCALATE IMMEDIATELY — Page on-call lead');
+      actions.push('Initiate rollback if recent deployment is suspected cause');
+    }
+    if (severity.label === 'HIGH') {
+      actions.push('Notify stakeholders — ETA update every 30 mins');
+    }
+
+    if (extracted.errorCodes?.length && !actions.some(a => a.includes('error code'))) {
+      actions.push(`Search runbook for: ${extracted.errorCodes.slice(0, 2).join(', ')}`);
+    }
+
+    return [...new Set(actions)].slice(0, 6);
+  }
+
+  return { analyze };
+})();
+
+window.IncidentEngine = Engine;
+
+----------------llm.js----------------
+
+
+
+
+
+
+
+// ════════════════════════════════════════════════════════
+//  LLM ABSTRACTION MODULE
+//  Supports: OpenAI + Groq + Google Gemini
+// ════════════════════════════════════════════════════════
+
+window.LLM = (() => {
+
+  // ── Provider config ───────────────────────────────────
+  const PROVIDERS = {
+    openai: { baseUrl: 'https://api.openai.com/v1', jsonMode: true  },
+    groq:   { baseUrl: 'https://api.groq.com/openai/v1', jsonMode: false },
+  };
+
+  // ── Call OpenAI-compatible API (OpenAI + Groq) ────────
+  async function callOpenAICompat(provider, apiKey, model, systemPrompt, userMessage, onChunk) {
+    const cfg = PROVIDERS[provider];
+    const body = {
+      model: model || 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userMessage },
+      ],
+      temperature: 0.3,
+      max_tokens: 1200,
+      stream: !!onChunk,
+    };
+    // Only add json_object mode when the provider supports it
+    if (cfg.jsonMode) body.response_format = { type: 'json_object' };
+
+    const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error?.message || `${provider} API error: ${res.status}`);
+    }
+
+    if (onChunk) {
+      return streamResponse(res, onChunk);
+    } else {
+      const data = await res.json();
+      return data.choices[0].message.content;
+    }
+  }
+
+  // ── Call Gemini ───────────────────────────────────────
+  async function callGemini(apiKey, model, systemPrompt, userMessage, onChunk) {
+    const geminiModel = model || 'gemini-1.5-flash';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:${onChunk ? 'streamGenerateContent' : 'generateContent'}?key=${apiKey}`;
+
+    const body = {
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 1200,
+        responseMimeType: 'application/json',
+      },
+    };
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Gemini error: ${res.status}`);
+    }
+
+    if (onChunk) {
+      return streamGeminiResponse(res, onChunk);
+    } else {
+      const data = await res.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    }
+  }
+
+  // ── Stream OpenAI SSE ─────────────────────────────────
+  async function streamResponse(res, onChunk) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const lines = decoder.decode(value).split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const json = JSON.parse(data);
+          const delta = json.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            fullText += delta;
+            onChunk(delta, fullText);
+          }
+        } catch {}
+      }
+    }
+    return fullText;
+  }
+
+  // ── Stream Gemini NDJSON ──────────────────────────────
+  async function streamGeminiResponse(res, onChunk) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value);
+
+      // Gemini streams JSON array fragments
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === '[' || trimmed === ']' || trimmed === ',') continue;
+        try {
+          const parsed = JSON.parse(trimmed.replace(/^,/, ''));
+          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          if (text) {
+            fullText += text;
+            onChunk(text, fullText);
+          }
+        } catch {}
+      }
+    }
+    return fullText;
+  }
+
+  // ── Parse JSON from LLM response ─────────────────────
+  function parseResult(raw) {
+    try {
+      // Strip any markdown fences if present
+      const clean = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+      return JSON.parse(clean);
+    } catch (e) {
+      throw new Error('LLM returned invalid JSON. Please try again.');
+    }
+  }
+
+  // ── Main public method ────────────────────────────────
+  async function analyze({ provider, apiKey, model, incidentText, onChunk }) {
+    if (!apiKey?.trim()) throw new Error('API key is required for AI mode.');
+    if (!incidentText?.trim()) throw new Error('No incident text to analyze.');
+
+    const systemPrompt = window.Prompts.system;
+    const userMessage  = window.Prompts.buildUserMessage(incidentText);
+
+    let raw;
+    if (provider === 'openai' || provider === 'groq') {
+      raw = await callOpenAICompat(provider, apiKey, model, systemPrompt, userMessage, onChunk);
+    } else if (provider === 'gemini') {
+      raw = await callGemini(apiKey, model, systemPrompt, userMessage, onChunk);
+    } else {
+      throw new Error(`Unknown provider: ${provider}`);
+    }
+
+    return parseResult(raw);
+  }
+
+  return { analyze };
+})();
+
+
+
+manifest.js ------------------------
+
+
+
+
+
+{
+  "manifest_version": 3,
+  "name": "Incident Summarizer Pro",
+  "version": "3.0",
+  "description": "AI-powered incident & ticket analyzer for developers. Smart offline mode + GPT-4o/Gemini. Root cause, solution, actions — instantly.",
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+S", "mac": "MacCtrl+Shift+S" },
+      "description": "Open Incident Summarizer"
+    }
+  },
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "Summarize Incident",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
+
+
+
+
+
+prompts -----------------------------
+
+
+// ════════════════════════════════════════════════════════
+//  PROMPT TEMPLATES — Incident Analyzer
+// ════════════════════════════════════════════════════════
+
+window.Prompts = {
+
+  system: `You are an expert Site Reliability Engineer (SRE) and incident responder with 10+ years of experience triaging production incidents across cloud-native, database, and distributed systems.
+
+Your job is to analyze incident ticket descriptions and return a structured, actionable analysis that helps developers immediately understand the issue and know what to do.
+
+IMPORTANT RULES:
+- Be concise, direct, and technical
+- Use developer-friendly language
+- Do NOT state the obvious or repeat the input text verbatim
+- Always provide specific, actionable steps
+- If something is unclear, say so rather than guessing
+
+You MUST respond with valid JSON only — no markdown fences, no extra text.`,
+
+  buildUserMessage(incidentText) {
+    return `Analyze this incident/ticket description and return a JSON object with EXACTLY this structure:
+
+{
+  "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
+  "severityColor": "#ff4d4d" | "#f59e0b" | "#facc15" | "#22c55e",
+  "severityReason": "One sentence explaining why this severity was chosen",
+  "categories": ["Category1", "Category2"],
+  "whatHappened": ["Concise sentence 1", "Sentence 2", "Sentence 3"],
+  "affected": "Who/what is affected (users, services, environments)",
+  "timestamps": ["extracted timestamp 1", "timestamp 2"],
+  "errorCodes": ["ERR-123", "503"],
+  "rootCause": ["Most likely cause sentence 1", "Possible cause 2"],
+  "solution": [
+    "Step 1 — most important immediate action",
+    "Step 2",
+    "Step 3",
+    "Step 4",
+    "Step 5"
+  ],
+  "immediateActions": [
+    "Action 1 to take right now",
+    "Action 2",
+    "Action 3"
+  ],
+  "postMortemQuestions": [
+    "Question to answer in post-mortem 1",
+    "Question 2"
+  ]
+}
+
+Severity guide:
+- CRITICAL: Production down, data loss, security breach, all users affected
+- HIGH: Major degradation, many users affected, SLA at risk
+- MEDIUM: Partial impact, workaround exists, some users affected
+- LOW: Minor issue, cosmetic, enhancement, single user
+
+INCIDENT DESCRIPTION:
+---
+${incidentText.slice(0, 6000)}
+---
+
+Respond with valid JSON only.`;
+  },
+};
+
+
+
+sidepanal.html--------------------
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Incident Summarizer Pro</title>
+  <!-- Removed Google Fonts link -->
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-base: #0f1115;
+      --bg-surface: #1a1d24;
+      --bg-surface-hover: #22262f;
+      --c-text: #e2e8f0;
+      --c-muted: #94a3b8;
+      --c-border: #2e3440;
+      --c-accent: #38bdf8;
+      --c-ai: #c084fc;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+      --shadow-md: 0 4px 6px rgba(0,0,0,0.5);
+
+      /* System fonts for privacy (no external CDN) */
+      --font-heading: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+
+      --c-critical: #ff4d4d;
+      --c-high:     #f59e0b;
+      --c-medium:   #facc15;
+      --c-low:      #22c55e;
+      --c-purple:   #a78bfa;
+    }
+
+    html, body { height: 100%; }
+
+    body {
+      font-family: var(--font-body);
+      background: var(--bg-base);
+      color: var(--c-text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+      font-size: 13px;
+    }
+
+    /* ── HEADER ── */
+    header {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--c-border);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .logo-mark {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      background: var(--c-accent);
+      color: #000;
+      padding: 3px 6px;
+      border-radius: 4px;
+      letter-spacing: 0.05em;
+    }
+
+    .header-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--c-text);
+    }
+
+    .header-meta {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-muted);
+      margin-top: 1px;
+    }
+
+    .header-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+
+    .platform-badge {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-accent);
+      background: rgba(56,189,248,0.08);
+      border: 1px solid rgba(56,189,248,0.2);
+      padding: 2px 7px;
+      border-radius: 20px;
+      display: none;
+    }
+
+    .icon-btn {
+      background: none;
+      border: 1px solid var(--c-border);
+      border-radius: 6px;
+      color: var(--c-muted);
+      cursor: pointer;
+      font-size: 14px;
+      width: 26px; height: 26px;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.15s;
+    }
+    .icon-btn:hover { color: var(--c-text); border-color: var(--c-border); }
+
+    /* Tab Bar (Hidden since history is removed, but kept for future use if needed) */
+    .tab-bar {
+      display: none;
+    }
+
+    .tab {
+      flex: 1;
+      padding: 7px 4px;
+      text-align: center;
+      font-size: 10px;
+      font-weight: 600;
+      font-family: var(--font-mono);
+      letter-spacing: 0.05em;
+      cursor: pointer;
+      border: none;
+      background: none;
+      color: var(--c-muted);
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .tab.active { color: var(--c-accent); border-bottom-color: var(--c-accent); }
+    .tab:hover:not(.active) { color: var(--c-text); }
+
+    /* ── MODE TOGGLE ── */
+    .mode-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 12px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--c-border);
+      flex-shrink: 0;
+    }
+
+    .mode-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .mode-toggle {
+      display: flex;
+      background: var(--bg-base);
+      border: 1px solid var(--c-border);
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .mode-btn {
+      padding: 4px 10px;
+      border-radius: 4px;
+      border: none;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 600;
+      cursor: pointer;
+      background: none;
+      color: var(--c-muted);
+      transition: all 0.15s;
+      letter-spacing: 0.05em;
+    }
+    .mode-btn.active-smart { background: var(--c-accent); color: #000; }
+    .mode-btn.active-ai    { background: var(--c-ai); color: #000; }
+    .mode-btn:not([class*="active"]):hover { color: var(--c-text); }
+
+    .ai-model-select {
+      margin-left: auto;
+      background: var(--bg-base);
+      border: 1px solid var(--c-border);
+      border-radius: 5px;
+      color: var(--c-text);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      padding: 3px 6px;
+      cursor: pointer;
+      display: none;
+    }
+    .ai-model-select.visible { display: block; }
+
+    /* ── SETTINGS DRAWER ── */
+    .settings-drawer {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--c-border);
+      padding: 12px;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .settings-drawer.open { display: flex; }
+
+    .ai-settings-desc {
+      font-size: 0.85rem;
+      color: var(--c-muted);
+      margin-bottom: 12px;
+      line-height: 1.4;
+    }
+    .security-warning {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 16px;
+      font-size: 0.8rem;
+      color: #fca5a5;
+      line-height: 1.4;
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+    }
+    .security-warning-icon {
+      font-size: 1rem;
+    }
+
+    .settings-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .settings-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      width: 70px;
+      flex-shrink: 0;
+    }
+
+    .settings-input {
+      flex: 1;
+      background: var(--bg-base);
+      border: 1px solid var(--c-border);
+      border-radius: 5px;
+      padding: 5px 8px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--c-text);
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .settings-input:focus { border-color: rgba(192,132,252,0.4); }
+    .settings-input::placeholder { color: var(--c-muted); }
+
+    .save-key-btn {
+      padding: 5px 10px;
+      background: var(--c-ai);
+      border: none;
+      border-radius: 5px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 700;
+      color: #000;
+      cursor: pointer;
+      transition: filter 0.15s;
+    }
+    .save-key-btn:hover { filter: brightness(1.1); }
+
+    .key-status {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-low);
+      display: none;
+    }
+    .key-status.visible { display: inline; }
+
+    /* ── MAIN SCROLL AREA ── */
+    .main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .main::-webkit-scrollbar { width: 3px; }
+    .main::-webkit-scrollbar-thumb { background: var(--c-border); border-radius: 2px; }
+
+    /* ── WELCOME ── */
+    .welcome {
+      background: var(--bg-surface);
+      border: 1px solid var(--c-border);
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+    }
+
+    .welcome-icon { font-size: 26px; margin-bottom: 8px; }
+
+    .welcome h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--c-accent);
+      margin-bottom: 6px;
+    }
+
+    .welcome p {
+      font-size: 11px;
+      color: var(--c-muted);
+      line-height: 1.7;
+    }
+
+    .feature-list {
+      margin-top: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      text-align: left;
+    }
+
+    .feature-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 11px;
+      color: var(--c-text);
+      background: var(--bg-surface-hover);
+      padding: 5px 9px;
+      border-radius: 6px;
+    }
+    .feature-item .fi-icon { font-size: 12px; flex-shrink: 0; }
+
+    /* ── RESULT CARD ── */
+    .result-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--c-border);
+      border-radius: 10px;
+      overflow: hidden;
+      animation: fadeUp 0.25s ease;
+    }
+
+    .result-card.ai-mode { border-color: rgba(192,132,252,0.25); }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .card-header {
+      padding: 9px 12px;
+      background: var(--bg-surface-hover);
+      border-bottom: 1px solid var(--c-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .card-title-group { display: flex; align-items: center; gap: 6px; }
+
+    .card-title {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--c-muted);
+    }
+
+    .ai-badge {
+      font-family: var(--font-mono);
+      font-size: 8px;
+      color: var(--c-ai);
+      border: 1px solid rgba(192,132,252,0.3);
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: rgba(192,132,252,0.08);
+    }
+
+    .copy-btn {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--c-border);
+      background: none;
+      color: var(--c-muted);
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex; align-items: center; gap: 4px;
+    }
+    .copy-btn:hover { color: var(--c-text); border-color: var(--c-border); }
+    .copy-btn.copied { color: var(--c-low); border-color: rgba(34,197,94,0.3); }
+
+    .card-body { padding: 10px 12px; }
+
+    /* ── SEVERITY BANNER ── */
+    .severity-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 7px;
+      border: 1px solid;
+      margin-bottom: 10px;
+    }
+
+    .sev-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      animation: blink 1.5s infinite;
+    }
+
+    @keyframes blink {
+      0%,100% { opacity: 1; }
+      50% { opacity: 0.25; }
+    }
+
+    .sev-label {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+
+    .sev-reason {
+      font-size: 10px;
+      color: var(--c-muted);
+      line-height: 1.5;
+      margin-top: 4px;
+      font-style: italic;
+    }
+
+    .sev-desc {
+      font-size: 10px;
+      margin-left: auto;
+      opacity: 0.7;
+      flex-shrink: 0;
+    }
+
+    /* ── SECTION ── */
+    .section { margin-bottom: 10px; }
+    .section:last-child { margin-bottom: 0; }
+
+    .section-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--c-muted);
+      margin-bottom: 5px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .section-label::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--c-border);
+    }
+
+    /* ── WHAT HAPPENED ── */
+    .what-happened {
+      background: var(--bg-surface-hover);
+      border-radius: 7px;
+      padding: 8px 10px;
+    }
+
+    .sentence {
+      font-size: 12px;
+      line-height: 1.7;
+      color: var(--c-text);
+      padding: 3px 0;
+      border-bottom: 1px solid var(--c-border);
+    }
+    .sentence:last-child { border-bottom: none; padding-bottom: 0; }
+    .sentence:first-child { padding-top: 0; }
+
+    /* ── AFFECTED ── */
+    .affected-text {
+      font-size: 11px;
+      color: var(--c-text);
+      background: var(--bg-surface-hover);
+      padding: 7px 10px;
+      border-radius: 7px;
+      line-height: 1.6;
+    }
+
+    /* ── ROOT CAUSE ── */
+    .root-cause-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .root-cause-item {
+      font-size: 11px;
+      color: var(--c-text);
+      background: rgba(167,139,250,0.06);
+      border: 1px solid rgba(167,139,250,0.15);
+      border-radius: 6px;
+      padding: 6px 9px;
+      line-height: 1.5;
+      display: flex;
+      gap: 6px;
+      align-items: flex-start;
+    }
+
+    .cause-icon { flex-shrink: 0; font-size: 11px; }
+
+    /* ── SOLUTION ── */
+    .solution-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .solution-item {
+      font-size: 11px;
+      line-height: 1.5;
+      color: var(--c-text);
+      background: rgba(56,189,248,0.05);
+      border: 1px solid rgba(56,189,248,0.12);
+      border-radius: 6px;
+      padding: 6px 9px;
+      display: flex;
+      gap: 7px;
+      align-items: flex-start;
+      transition: background 0.15s;
+    }
+    .solution-item:hover { background: rgba(56,189,248,0.09); }
+
+    .sol-num {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-accent);
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    /* ── CHIPS ── */
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+    .chip {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      border: 1px solid;
+    }
+
+    .chip-error  { background: rgba(255,77,77,0.08);  border-color: rgba(255,77,77,0.25);  color: #ff9999; }
+    .chip-ip     { background: rgba(56,189,248,0.08); border-color: rgba(56,189,248,0.25); color: var(--c-accent); }
+    .chip-time   { background: rgba(167,139,250,0.08);border-color: rgba(167,139,250,0.25);color: var(--c-purple); }
+    .chip-svc    { background: rgba(34,197,94,0.08);  border-color: rgba(34,197,94,0.25);  color: var(--c-low); }
+    .chip-num    { background: rgba(250,204,21,0.08); border-color: rgba(250,204,21,0.25); color: var(--c-medium); }
+    .chip-cat    { background: rgba(56,189,248,0.06); border-color: rgba(56,189,248,0.18); color: var(--c-accent); }
+    .chip-url    { background: rgba(167,139,250,0.06);border-color: rgba(167,139,250,0.18);color: var(--c-purple); max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chip-ver    { background: rgba(34,197,94,0.06);  border-color: rgba(34,197,94,0.18);  color: #86efac; }
+
+    /* ── ACTIONS ── */
+    .actions-list { display: flex; flex-direction: column; gap: 4px; }
+
+    .action-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      background: var(--bg-surface-hover);
+      border: 1px solid var(--c-border);
+      border-radius: 6px;
+      padding: 6px 9px;
+      font-size: 11px;
+      line-height: 1.5;
+      transition: border-color 0.15s;
+    }
+    .action-item:hover { border-color: var(--c-border); }
+
+    .action-num {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      color: var(--c-accent);
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    /* ── POST MORTEM ── */
+    .postmortem-list { display: flex; flex-direction: column; gap: 4px; }
+
+    .postmortem-item {
+      font-size: 11px;
+      color: var(--c-muted);
+      background: var(--bg-surface-hover);
+      border-radius: 5px;
+      padding: 5px 9px;
+      line-height: 1.5;
+      display: flex;
+      gap: 6px;
+    }
+    .pm-bullet { color: var(--c-purple); flex-shrink: 0; }
+
+    /* ── STATS ROW ── */
+    .stats-row { display: flex; gap: 5px; margin-bottom: 10px; }
+
+    .stat-box {
+      flex: 1;
+      background: var(--bg-surface-hover);
+      border: 1px solid var(--c-border);
+      border-radius: 7px;
+      padding: 7px 8px;
+      text-align: center;
+    }
+
+    .stat-val {
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--c-accent);
+    }
+
+    .stat-key {
+      font-size: 8px;
+      color: var(--c-muted);
+      margin-top: 2px;
+      font-family: var(--font-mono);
+    }
+
+    /* ── PROCESSING ── */
+    .processing {
+      background: var(--bg-surface);
+      border: 1px solid var(--c-border);
+      border-radius: 10px;
+      padding: 18px 14px;
+      text-align: center;
+      display: none;
+    }
+
+    .proc-bar {
+      height: 2px;
+      background: var(--c-border);
+      border-radius: 2px;
+      margin: 10px 0 7px;
+      overflow: hidden;
+    }
+
+    .proc-fill {
+      height: 100%;
+      border-radius: 2px;
+      animation: scan 1.2s ease-in-out infinite;
+    }
+    .proc-fill.smart { background: var(--c-accent); }
+    .proc-fill.ai    { background: var(--c-ai); }
+
+    @keyframes scan {
+      0%   { width: 0%;  margin-left: 0%; }
+      50%  { width: 60%; margin-left: 20%; }
+      100% { width: 0%;  margin-left: 100%; }
+    }
+
+    .proc-label {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--c-muted);
+    }
+
+    /* ── STREAMING INDICATOR ── */
+    .streaming-cursor {
+      display: inline-block;
+      width: 6px;
+      height: 12px;
+      background: var(--c-ai);
+      border-radius: 1px;
+      animation: cursor-blink 0.8s step-end infinite;
+      vertical-align: text-bottom;
+      margin-left: 2px;
+    }
+
+    @keyframes cursor-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+
+    /* ── HISTORY TAB ── */
+    /* Removed history tab specific styles as the tab is hidden */
+
+    .empty-state {
+      text-align: center;
+      padding: 30px 16px;
+    }
+    .empty-state .es-icon { font-size: 28px; margin-bottom: 8px; }
+    .empty-state p { font-size: 11px; color: var(--c-muted); line-height: 1.7; }
+
+    /* ── TOAST ── */
+    .toast {
+      position: fixed;
+      bottom: 80px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--bg-surface-hover);
+      border: 1px solid var(--c-border);
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--c-low);
+      opacity: 0;
+      transition: all 0.2s ease;
+      pointer-events: none;
+      white-space: nowrap;
+      z-index: 999;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* ── BOTTOM BAR ── */
+    .bottom-bar {
+      flex-shrink: 0;
+      background: var(--bg-surface);
+      border-top: 1px solid var(--c-border);
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .btn-row { display: flex; gap: 5px; }
+
+    .btn {
+      flex: 1;
+      padding: 8px 8px;
+      border-radius: 7px;
+      border: none;
+      font-family: var(--font-body);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      transition: all 0.15s;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-grab { background: var(--c-accent); color: #000; }
+    .btn-grab:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
+    .btn-grab.ai-mode { background: var(--c-ai); }
+
+    .btn-clear {
+      background: var(--bg-surface-hover);
+      color: var(--c-muted);
+      border: 1px solid var(--c-border);
+    }
+    .btn-clear:hover { color: var(--c-text); border-color: var(--c-border); }
+
+    .input-row { display: flex; gap: 5px; }
+
+    textarea.paste-input {
+      flex: 1;
+      background: var(--bg-base);
+      border: 1px solid var(--c-border);
+      border-radius: 7px;
+      padding: 7px 9px;
+      font-family: var(--font-body);
+      font-size: 11px;
+      color: var(--c-text);
+      resize: none;
+      outline: none;
+      max-height: 68px;
+      line-height: 1.5;
+      transition: border-color 0.2s;
+    }
+    textarea.paste-input::placeholder { color: var(--c-muted); }
+    textarea.paste-input:focus { border-color: rgba(56,189,248,0.4); }
+    textarea.paste-input.ai-focused:focus { border-color: rgba(192,132,252,0.4); }
+
+    .btn-send {
+      width: 32px; height: 32px;
+      border-radius: 7px;
+      border: none;
+      background: var(--c-accent);
+      color: #000;
+      cursor: pointer;
+      font-size: 15px;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.15s;
+      flex-shrink: 0;
+      align-self: flex-end;
+    }
+    .btn-send:hover { filter: brightness(1.1); transform: translateY(-1px); }
+    .btn-send:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+    .btn-send.ai-mode { background: var(--c-ai); }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo-mark">INC</div>
+  <div>
+    <div class="header-title">Incident Summarizer</div>
+    <div class="header-meta">smart · instant · dev-ready</div>
+  </div>
+  <div class="header-actions">
+    <span class="platform-badge" id="platformBadge"></span>
+    <button class="icon-btn" id="settingsBtn" title="AI Settings">⚙</button>
+
+  </div>
+</header>
+
+<!-- Mode toggle -->
+<div class="mode-bar">
+  <span class="mode-label">Mode</span>
+  <div class="mode-toggle">
+    <button class="mode-btn active-smart" id="modeSmartBtn">⚡ Smart</button>
+    <button class="mode-btn" id="modeAiBtn">🤖 AI</button>
+  </div>
+  <select class="ai-model-select" id="modelSelect">
+    <optgroup label="OpenAI">
+      <option value="openai:gpt-4o">GPT-4o</option>
+      <option value="openai:gpt-4o-mini">GPT-4o mini</option>
+      <option value="openai:gpt-3.5-turbo">GPT-3.5 Turbo</option>
+    </optgroup>
+    <optgroup label="🚀 Groq (Fast &amp; Free)">
+      <option value="groq:llama-3.3-70b-versatile">Llama 3.3 70B</option>
+      <option value="groq:llama-3.1-8b-instant">Llama 3.1 8B (fastest)</option>
+      <option value="groq:mixtral-8x7b-32768">Mixtral 8x7B</option>
+      <option value="groq:gemma2-9b-it">Gemma 2 9B</option>
+    </optgroup>
+    <optgroup label="Google Gemini">
+      <option value="gemini:gemini-1.5-flash">Gemini 1.5 Flash</option>
+      <option value="gemini:gemini-1.5-pro">Gemini 1.5 Pro</option>
+      <option value="gemini:gemini-2.0-flash">Gemini 2.0 Flash</option>
+    </optgroup>
+  </select>
+</div>
+
+<!-- Settings drawer -->
+<div class="settings-drawer" id="settingsDrawer">
+  <div class="security-warning">
+    <div class="security-warning-icon">⚠️</div>
+    <div>
+      <strong>Accenture Security Policy:</strong><br/>
+      AI Mode sends incident text to external servers (OpenAI/Groq/Gemini). Do NOT use AI Mode for tickets containing highly confidential client data, PII, or internal IPs. Use Smart Mode instead.
+    </div>
+  </div>
+
+  <div class="settings-row">
+    <span class="settings-label">OpenAI Key</span>
+    <input type="password" class="settings-input" id="openaiKeyInput" placeholder="sk-proj-…"/>
+  </div>
+  <div class="settings-row">
+    <span class="settings-label">Groq Key</span>
+    <input type="password" class="settings-input" id="groqKeyInput" placeholder="gsk_…"/>
+  </div>
+  <div class="settings-row">
+    <span class="settings-label">Gemini Key</span>
+    <input type="password" class="settings-input" id="geminiKeyInput" placeholder="AIza…"/>
+  </div>
+  <div class="settings-row">
+    <button class="save-key-btn" id="saveKeysBtn">Save Keys</button>
+    <span class="key-status" id="keyStatus">✓ Saved</span>
+  </div>
+</div>
+
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab active" id="tabAnalyze" data-tab="analyze">Analyze</button>
+  <!-- Removed History tab button -->
+</div>
+
+<!-- Main scroll area -->
+<div class="main" id="mainAnalyze">
+
+  <!-- Welcome -->
+  <div class="welcome" id="welcomeCard">
+    <div class="welcome-icon">🔍</div>
+    <h2>Pro Incident Analyzer</h2>
+    <p>Paste or grab any ticket / incident description.<br/>Instantly understand what's happening.</p>
+    <div class="feature-list">
+      <div class="feature-item"><span class="fi-icon">⚡</span> Smart Mode — instant, 100% offline</div>
+      <div class="feature-item"><span class="fi-icon">🤖</span> AI Mode — GPT-4o / Gemini depth analysis</div>
+      <div class="feature-item"><span class="fi-icon">🎯</span> Works on Jira, GitHub, Linear, ServiceNow</div>
+      <div class="feature-item"><span class="fi-icon">🧠</span> Root cause inference + recommended solution</div>
+      <div class="feature-item"><span class="fi-icon">📋</span> One-click copy · History of last 5 analyses</div>
+    </div>
+  </div>
+
+  <!-- Processing animation -->
+  <div class="processing" id="processingCard">
+    <div style="font-size:22px;margin-bottom:7px;" id="procIcon">⚙️</div>
+    <div style="font-size:12px;font-weight:600;margin-bottom:3px;" id="procTitle">Analyzing incident…</div>
+    <div class="proc-bar"><div class="proc-fill smart" id="procFill"></div></div>
+    <div class="proc-label" id="procLabel">Reading description…</div>
+  </div>
+
+  <!-- Result injected here -->
+  <div id="resultArea"></div>
+
+</div>
+
+
+
+<!-- Toast -->
+<div class="toast" id="toast">✓ Copied to clipboard</div>
+
+<div class="bottom-bar">
+  <div class="btn-row">
+    <button class="btn btn-grab" id="grabBtn">📋 Grab from Page</button>
+    <button class="btn btn-clear" id="clearBtn">✕ Clear</button>
+  </div>
+  <div class="input-row">
+    <textarea class="paste-input" id="pasteInput" rows="2" placeholder="Or paste incident description here…"></textarea>
+    <button class="btn-send" id="sendBtn">↑</button>
+  </div>
+</div>
+
+<script src="engine.js"></script>
+<script src="prompts.js"></script>
+<script src="llm.js"></script>
+<script src="sidepanel.js"></script>
+</body>
+</html>
+
+
+
+
+
+
+sidepanal.js -------------------------
+
+
+
+// ════════════════════════════════════════════════════════
+//  SIDEPANEL CONTROLLER — Dual Mode (Smart + AI)
+// ════════════════════════════════════════════════════════
+
+// ── Element refs ─────────────────────────────────────────
+const grabBtn        = document.getElementById('grabBtn');
+const clearBtn       = document.getElementById('clearBtn');
+const sendBtn        = document.getElementById('sendBtn');
+const pasteInput     = document.getElementById('pasteInput');
+const welcomeCard    = document.getElementById('welcomeCard');
+const processingCard = document.getElementById('processingCard');
+const resultArea     = document.getElementById('resultArea');
+const procLabel      = document.getElementById('procLabel');
+const procFill       = document.getElementById('procFill');
+const procIcon       = document.getElementById('procIcon');
+const procTitle      = document.getElementById('procTitle');
+const platformBadge  = document.getElementById('platformBadge');
+const settingsBtn    = document.getElementById('settingsBtn');
+const settingsDrawer = document.getElementById('settingsDrawer');
+const openaiKeyInput = document.getElementById('openaiKeyInput');
+const groqKeyInput   = document.getElementById('groqKeyInput');
+const geminiKeyInput = document.getElementById('geminiKeyInput');
+const saveKeysBtn    = document.getElementById('saveKeysBtn');
+const keyStatus      = document.getElementById('keyStatus');
+const modelSelect    = document.getElementById('modelSelect');
+const modeSmartBtn   = document.getElementById('modeSmartBtn');
+const modeAiBtn      = document.getElementById('modeAiBtn');
+const mainAnalyze    = document.getElementById('mainAnalyze');
+const mainHistory    = document.getElementById('mainHistory');
+const historyList    = document.getElementById('historyList');
+const toast          = document.getElementById('toast');
+const tabAnalyze     = document.getElementById('tabAnalyze');
+const tabHistory     = document.getElementById('tabHistory');
+
+let busy    = false;
+let aiMode  = false;
+let lastRawText = '';
+
+// ════════════════════════════════════════════════════════
+//  INIT — load saved settings
+// ════════════════════════════════════════════════════════
+chrome.storage.local.get(['openaiKey', 'groqKey', 'geminiKey', 'selectedModel', 'aiMode'], (data) => {
+  if (data.openaiKey) openaiKeyInput.value = data.openaiKey;
+  if (data.groqKey)   groqKeyInput.value   = data.groqKey;
+  if (data.geminiKey) geminiKeyInput.value = data.geminiKey;
+  if (data.selectedModel) modelSelect.value = data.selectedModel;
+  if (data.aiMode) setMode('ai');
+  // Purge any previously stored incident history for compliance
+  chrome.storage.local.remove('history');
+});
+
+// ════════════════════════════════════════════════════════
+//  MODE TOGGLE
+// ════════════════════════════════════════════════════════
+modeSmartBtn.addEventListener('click', () => setMode('smart'));
+modeAiBtn.addEventListener('click', () => setMode('ai'));
+
+function setMode(mode) {
+  aiMode = mode === 'ai';
+  modeSmartBtn.classList.toggle('active-smart', !aiMode);
+  modeSmartBtn.classList.remove('active-ai');
+  modeAiBtn.classList.toggle('active-ai', aiMode);
+  modeAiBtn.classList.remove('active-smart');
+
+  modelSelect.classList.toggle('visible', aiMode);
+  grabBtn.classList.toggle('ai-mode', aiMode);
+  sendBtn.classList.toggle('ai-mode', aiMode);
+  pasteInput.classList.toggle('ai-focused', aiMode);
+
+  chrome.storage.local.set({ aiMode });
+}
+
+// ════════════════════════════════════════════════════════
+//  SETTINGS
+// ════════════════════════════════════════════════════════
+settingsBtn.addEventListener('click', () => {
+  settingsDrawer.classList.toggle('open');
+});
+
+saveKeysBtn.addEventListener('click', () => {
+  const openaiKey = openaiKeyInput.value.trim();
+  const groqKey   = groqKeyInput.value.trim();
+  const geminiKey = geminiKeyInput.value.trim();
+  const selectedModel = modelSelect.value;
+  chrome.storage.local.set({ openaiKey, groqKey, geminiKey, selectedModel }, () => {
+    keyStatus.classList.add('visible');
+    setTimeout(() => keyStatus.classList.remove('visible'), 2000);
+  });
+});
+
+modelSelect.addEventListener('change', () => {
+  chrome.storage.local.set({ selectedModel: modelSelect.value });
+});
+
+// ════════════════════════════════════════════════════════
+//  TAB SWITCHING (Analyze only — History removed)
+// ════════════════════════════════════════════════════════
+tabAnalyze.addEventListener('click', () => switchTab('analyze'));
+
+function switchTab(tab) {
+  tabAnalyze.classList.add('active');
+  mainAnalyze.classList.remove('hidden');
+}
+
+// ════════════════════════════════════════════════════════
+//  GRAB FROM PAGE
+// ════════════════════════════════════════════════════════
+grabBtn.addEventListener('click', () => {
+  if (busy) return;
+  grabBtn.disabled = true;
+  grabBtn.textContent = '⏳ Reading page…';
+
+  chrome.runtime.sendMessage({ action: 'getPageText' }, (res) => {
+    grabBtn.disabled = false;
+    grabBtn.innerHTML = aiMode ? '🤖 Grab from Page' : '📋 Grab from Page';
+
+    if (res?.error || !res?.text?.trim()) {
+      showError('Could not read this page. Try pasting the description below.', res?.error);
+      return;
+    }
+
+    // Show platform badge
+    if (res.platform && res.platform !== 'unknown') {
+      platformBadge.textContent = res.platform;
+      platformBadge.style.display = 'inline';
+    }
+
+    processText(res.text.trim());
+  });
+});
+
+// ════════════════════════════════════════════════════════
+//  MANUAL PASTE
+// ════════════════════════════════════════════════════════
+sendBtn.addEventListener('click', handleSend);
+pasteInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+});
+
+function handleSend() {
+  const text = pasteInput.value.trim();
+  if (!text || busy) return;
+  pasteInput.value = '';
+  platformBadge.style.display = 'none';
+  processText(text);
+}
+
+// ════════════════════════════════════════════════════════
+//  CLEAR
+// ════════════════════════════════════════════════════════
+clearBtn.addEventListener('click', () => {
+  resultArea.innerHTML = '';
+  welcomeCard.classList.remove('hidden');
+  processingCard.style.display = 'none';
+  platformBadge.style.display = 'none';
+  lastRawText = '';
+  busy = false;
+});
+
+// ════════════════════════════════════════════════════════
+//  PROCESS TEXT — routes to Smart or AI mode
+// ════════════════════════════════════════════════════════
+async function processText(text) {
+  busy = true;
+  lastRawText = text;
+
+  welcomeCard.classList.add('hidden');
+  resultArea.innerHTML = '';
+  processingCard.style.display = 'block';
+
+  // Update UI for mode
+  procFill.className = `proc-fill ${aiMode ? 'ai' : 'smart'}`;
+  procIcon.textContent = aiMode ? '🤖' : '⚙️';
+  procTitle.textContent = aiMode ? 'Asking AI…' : 'Analyzing incident…';
+
+  if (aiMode) {
+    // ── AI MODE ──────────────────────────────────────────
+    const steps = ['Connecting to AI…', 'Sending prompt…', 'Waiting for response…', 'Processing…'];
+    let si = 0;
+    const labelInterval = setInterval(() => {
+      procLabel.textContent = steps[Math.min(si++, steps.length - 1)];
+    }, 800);
+
+    try {
+      const stored = await new Promise(r => chrome.storage.local.get(['openaiKey', 'groqKey', 'geminiKey', 'selectedModel'], r));
+      const [provider, model] = (stored.selectedModel || 'openai:gpt-4o').split(':');
+      const apiKey = provider === 'openai' ? stored.openaiKey
+                   : provider === 'groq'   ? stored.groqKey
+                   : stored.geminiKey;
+
+      if (!apiKey) {
+        clearInterval(labelInterval);
+        processingCard.style.display = 'none';
+        busy = false;
+        showError('No API key found. Click ⚙ to add your API key.', 'Missing key for ' + provider);
+        return;
+      }
+
+      // Show initial streaming skeleton
+      clearInterval(labelInterval);
+      processingCard.style.display = 'none';
+      busy = false;
+
+      renderStreamingPlaceholder(provider, model);
+
+      const result = await LLM.analyze({
+        provider,
+        apiKey,
+        model,
+        incidentText: text,
+        onChunk: null, // full JSON response only — streaming JSON is tricky to parse incrementally
+      });
+
+      renderAiResult(result, provider, model);
+
+    } catch (err) {
+      processingCard.style.display = 'none';
+      busy = false;
+      showError(`AI error: ${err.message}`, err.message);
+    }
+
+  } else {
+    // ── SMART MODE ───────────────────────────────────────
+    const steps = ['Reading description…', 'Scoring sentences…', 'Detecting severity…', 'Extracting signals…', 'Building summary…'];
+    let i = 0;
+    const interval = setInterval(() => {
+      procLabel.textContent = steps[Math.min(i++, steps.length - 1)];
+    }, 100);
+
+    setTimeout(() => {
+      clearInterval(interval);
+      processingCard.style.display = 'none';
+      busy = false;
+
+      const result = IncidentEngine.analyze(text);
+      if (!result) {
+        showError('Text too short. Paste a longer incident description (at least a sentence or two).');
+        return;
+      }
+      renderSmartResult(result);
+    }, 350);
+  }
+}
+
+// ════════════════════════════════════════════════════════
+//  RENDER — Smart Mode
+// ════════════════════════════════════════════════════════
+function renderSmartResult(r) {
+  const sev = r.severity;
+  const html = `
+    <div class="result-card">
+      <div class="card-header">
+        <div class="card-title-group">
+          <span class="card-title">Smart Analysis</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div class="chips">${r.categories.map(c => `<span class="chip chip-cat">${escHtml(c)}</span>`).join('')}</div>
+          <button class="copy-btn" onclick="copyResult(this)">⎘ Copy</button>
+        </div>
+      </div>
+
+      <div class="card-body">
+        ${renderSeverityBanner(sev)}
+
+        <div class="stats-row">
+          <div class="stat-box">
+            <div class="stat-val">${r.summaryLength}</div>
+            <div class="stat-key">key sentences</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-val">${r.readTime}m</div>
+            <div class="stat-key">read time</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-val">${r.actions.length}</div>
+            <div class="stat-key">actions</div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">📌 What Happened</div>
+          <div class="what-happened">
+            ${r.whatHappened.map(s => `<div class="sentence">${escHtml(s)}</div>`).join('')}
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">👥 Who / What Affected</div>
+          <div class="affected-text">${escHtml(r.affected)}</div>
+        </div>
+
+        ${renderRootCause(r.rootCause)}
+
+        ${renderExtracted(r.extracted)}
+
+        ${r.timeline ? `
+        <div class="section">
+          <div class="section-label">🕐 Timestamps</div>
+          <div class="chips">${r.timeline.map(t => `<span class="chip chip-time">${escHtml(t)}</span>`).join('')}</div>
+        </div>` : ''}
+
+        <div class="section">
+          <div class="section-label">💡 Recommended Solution</div>
+          <div class="solution-list">
+            ${r.solution.map((s, i) => `
+              <div class="solution-item">
+                <span class="sol-num">${String(i+1).padStart(2,'0')}</span>
+                <span>${escHtml(s)}</span>
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">✅ Immediate Actions</div>
+          <div class="actions-list">
+            ${r.actions.map((a, i) => `
+              <div class="action-item">
+                <span class="action-num">${String(i+1).padStart(2,'0')}</span>
+                <span>${escHtml(a)}</span>
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  resultArea.innerHTML = html;
+}
+
+// ════════════════════════════════════════════════════════
+//  RENDER — AI Streaming Placeholder
+// ════════════════════════════════════════════════════════
+function renderStreamingPlaceholder(provider, model) {
+  resultArea.innerHTML = `
+    <div class="result-card ai-mode" id="aiResultCard">
+      <div class="card-header">
+        <div class="card-title-group">
+          <span class="card-title">AI Analysis</span>
+          <span class="ai-badge">${escHtml(provider)} · ${escHtml(model)}</span>
+        </div>
+      </div>
+      <div class="card-body" style="text-align:center;padding:20px;">
+        <div style="font-size:22px;margin-bottom:8px;">🤖</div>
+        <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:var(--c-ai);">AI is thinking<span class="streaming-cursor"></span></div>
+        <div style="font-size:10px;color:var(--muted);">Generating detailed incident analysis…</div>
+      </div>
+    </div>`;
+}
+
+// ════════════════════════════════════════════════════════
+//  RENDER — AI Mode (full result)
+// ════════════════════════════════════════════════════════
+function renderAiResult(r, provider, model) {
+  const sevColor = r.severityColor || getSevColor(r.severity);
+  const sev = { color: sevColor, label: r.severity, hits: [] };
+
+  const html = `
+    <div class="result-card ai-mode">
+      <div class="card-header">
+        <div class="card-title-group">
+          <span class="card-title">AI Analysis</span>
+          <span class="ai-badge">${escHtml(provider)} · ${escHtml(model)}</span>
+        </div>
+        <button class="copy-btn" onclick="copyResult(this)">⎘ Copy</button>
+      </div>
+
+      <div class="card-body">
+        ${renderSeverityBanner(sev, r.severityReason)}
+
+        ${r.categories?.length ? `
+        <div class="section">
+          <div class="section-label">🏷 Categories</div>
+          <div class="chips">${r.categories.map(c => `<span class="chip chip-cat">${escHtml(c)}</span>`).join('')}</div>
+        </div>` : ''}
+
+        ${r.whatHappened?.length ? `
+        <div class="section">
+          <div class="section-label">📌 What Happened</div>
+          <div class="what-happened">
+            ${r.whatHappened.map(s => `<div class="sentence">${escHtml(s)}</div>`).join('')}
+          </div>
+        </div>` : ''}
+
+        ${r.affected ? `
+        <div class="section">
+          <div class="section-label">👥 Who / What Affected</div>
+          <div class="affected-text">${escHtml(r.affected)}</div>
+        </div>` : ''}
+
+        ${r.rootCause?.length ? renderRootCause(r.rootCause) : ''}
+
+        ${(r.errorCodes?.length || r.timestamps?.length) ? `
+        <div class="section">
+          <div class="section-label">🔍 Extracted Signals</div>
+          <div class="chips">
+            ${(r.errorCodes || []).map(e => `<span class="chip chip-error">${escHtml(e)}</span>`).join('')}
+            ${(r.timestamps || []).map(t => `<span class="chip chip-time">${escHtml(t)}</span>`).join('')}
+          </div>
+        </div>` : ''}
+
+        ${r.solution?.length ? `
+        <div class="section">
+          <div class="section-label">💡 Recommended Solution</div>
+          <div class="solution-list">
+            ${r.solution.map((s, i) => `
+              <div class="solution-item">
+                <span class="sol-num">${String(i+1).padStart(2,'0')}</span>
+                <span>${escHtml(s)}</span>
+              </div>`).join('')}
+          </div>
+        </div>` : ''}
+
+        ${r.immediateActions?.length ? `
+        <div class="section">
+          <div class="section-label">✅ Immediate Actions</div>
+          <div class="actions-list">
+            ${r.immediateActions.map((a, i) => `
+              <div class="action-item">
+                <span class="action-num">${String(i+1).padStart(2,'0')}</span>
+                <span>${escHtml(a)}</span>
+              </div>`).join('')}
+          </div>
+        </div>` : ''}
+
+        ${r.postMortemQuestions?.length ? `
+        <div class="section">
+          <div class="section-label">📝 Post-Mortem Questions</div>
+          <div class="postmortem-list">
+            ${r.postMortemQuestions.map(q => `
+              <div class="postmortem-item">
+                <span class="pm-bullet">?</span>
+                <span>${escHtml(q)}</span>
+              </div>`).join('')}
+          </div>
+        </div>` : ''}
+
+      </div>
+    </div>`;
+
+  resultArea.innerHTML = html;
+}
+
+// ════════════════════════════════════════════════════════
+//  SHARED RENDER HELPERS
+// ════════════════════════════════════════════════════════
+function renderSeverityBanner(sev, reason) {
+  return `
+    <div class="severity-banner" style="background:${sev.color}0d;border-color:${sev.color}30;">
+      <div class="sev-dot" style="background:${sev.color};box-shadow:0 0 8px ${sev.color};"></div>
+      <div>
+        <span class="sev-label" style="color:${sev.color}">${escHtml(sev.label)}</span>
+        ${reason ? `<div class="sev-reason">${escHtml(reason)}</div>` : ''}
+      </div>
+      <span class="sev-desc">${getSevDesc(sev.label)}</span>
+    </div>`;
+}
+
+function renderRootCause(causes) {
+  if (!causes?.length) return '';
+  return `
+    <div class="section">
+      <div class="section-label">🔎 Probable Root Cause</div>
+      <div class="root-cause-list">
+        ${causes.map(c => `
+          <div class="root-cause-item">
+            <span class="cause-icon">→</span>
+            <span>${escHtml(c)}</span>
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+function renderExtracted(ex) {
+  const sections = [];
+  if (ex.errorCodes?.length) {
+    sections.push(`
+      <div class="section">
+        <div class="section-label">🔴 Error Codes</div>
+        <div class="chips">${ex.errorCodes.map(e => `<span class="chip chip-error">${escHtml(e)}</span>`).join('')}</div>
+      </div>`);
+  }
+  if (ex.ips?.length) {
+    sections.push(`
+      <div class="section">
+        <div class="section-label">🌐 IP Addresses</div>
+        <div class="chips">${ex.ips.map(ip => `<span class="chip chip-ip">${escHtml(ip)}</span>`).join('')}</div>
+      </div>`);
+  }
+  if (ex.services?.length) {
+    sections.push(`
+      <div class="section">
+        <div class="section-label">⚙️ Services Mentioned</div>
+        <div class="chips">${ex.services.map(s => `<span class="chip chip-svc">${escHtml(s)}</span>`).join('')}</div>
+      </div>`);
+  }
+  if (ex.userCounts?.length || ex.percentages?.length) {
+    const all = [...(ex.userCounts || []), ...(ex.percentages || [])];
+    sections.push(`
+      <div class="section">
+        <div class="section-label">📊 Numbers & Impact</div>
+        <div class="chips">${all.map(n => `<span class="chip chip-num">${escHtml(n)}</span>`).join('')}</div>
+      </div>`);
+  }
+  if (ex.urls?.length) {
+    sections.push(`
+      <div class="section">
+        <div class="section-label">🔗 URLs Found</div>
+        <div class="chips">${ex.urls.map(u => `<span class="chip chip-url" title="${escHtml(u)}">${escHtml(u.replace(/^https?:\/\//, '').slice(0, 30))}…</span>`).join('')}</div>
+      </div>`);
+  }
+  if (ex.versions?.length) {
+    sections.push(`
+      <div class="section">
+        <div class="section-label">🏷 Versions</div>
+        <div class="chips">${ex.versions.map(v => `<span class="chip chip-ver">${escHtml(v)}</span>`).join('')}</div>
+      </div>`);
+  }
+  return sections.join('');
+}
+
+// ════════════════════════════════════════════════════════
+//  COPY TO CLIPBOARD
+// ════════════════════════════════════════════════════════
+window.copyResult = function(btn) {
+  const card = btn.closest('.result-card');
+  const lines = [];
+
+  // Build plain-text copy from result
+  card.querySelectorAll('.sev-label').forEach(el => lines.push(`SEVERITY: ${el.textContent.trim()}`));
+  card.querySelectorAll('.section-label').forEach(label => {
+    lines.push(`\n${label.textContent.replace(/[^\w\s/]/g, '').trim().toUpperCase()}`);
+    const parent = label.parentElement;
+    parent.querySelectorAll('.sentence,.affected-text,.root-cause-item,.solution-item,.action-item,.postmortem-item').forEach(el => {
+      const num = el.querySelector('.sol-num, .action-num')?.textContent || '';
+      const txt = el.textContent.replace(num, '').trim();
+      lines.push(num ? `  ${num}. ${txt}` : `  • ${txt}`);
+    });
+    parent.querySelectorAll('.chip').forEach(chip => {
+      lines.push(`  [${chip.textContent.trim()}]`);
+    });
+  });
+
+  navigator.clipboard.writeText(lines.join('\n')).then(() => {
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    showToast('✓ Copied to clipboard');
+    setTimeout(() => {
+      btn.innerHTML = '⎘ Copy';
+      btn.classList.remove('copied');
+    }, 2000);
+  });
+};
+
+
+
+// ════════════════════════════════════════════════════════
+//  TOAST
+// ════════════════════════════════════════════════════════
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 2200);
+}
+
+// ════════════════════════════════════════════════════════
+//  ERROR STATE
+// ════════════════════════════════════════════════════════
+function showError(msg, detail) {
+  welcomeCard.classList.add('hidden');
+  resultArea.innerHTML = `
+    <div class="result-card">
+      <div class="card-body" style="text-align:center;padding:22px;">
+        <div style="font-size:22px;margin-bottom:8px;">⚠️</div>
+        <div style="font-size:12px;font-weight:600;margin-bottom:6px;color:var(--text);">${escHtml(msg)}</div>
+        ${detail ? `<div style="font-size:10px;color:var(--muted);font-family:var(--mono);">${escHtml(detail)}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+// ════════════════════════════════════════════════════════
+//  UTILITY
+// ════════════════════════════════════════════════════════
+function getSevDesc(label) {
+  return { CRITICAL: 'Immediate action', HIGH: 'Urgent attention', MEDIUM: 'Monitor closely', LOW: 'Normal priority' }[label] || '';
+}
+
+function getSevColor(label) {
+  return { CRITICAL: '#ff4d4d', HIGH: '#f59e0b', MEDIUM: '#facc15', LOW: '#22c55e' }[label] || '#566373';
+}
+
+function escHtml(str) {
+  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
